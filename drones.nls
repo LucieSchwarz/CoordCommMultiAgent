@@ -1,0 +1,455 @@
+;-----------
+;  DRONES
+;-----------
+
+drones-own[
+  incoming-queue ; Structure de communication
+  leader?        ; Indique si le drone est le leader des drones
+  fuel           ; Carburant en stock
+  ammo           ; Munitions en stock
+  id-drone       ; Identifiant unique du drone (contrairement au who, il va de 0 à nb-drone - 1)
+  drone-next     ; Prochain patch vers lequel doit se rendre le drone
+  drone-path     ; Chemin parcouru actuellement par le drone
+  going-base?    ; Indique si le drone est en train d'aller a la base pour ravitaillement
+  observations   ; Observations d'ennemis (données possédées par le leader)
+  move-mode      ; Type de déplacement du drone selon sa tâche
+  rotation-angle ; Angle total tourné depuis le début d'un cercle de protection (le cercle se termine à 360°)
+  mission        ; Mission du drone : protection ou chasseur/explorateur
+  start-tick     ; Chaque drone part avec un décalage de temps sur la pise de décollage
+  leader-convoi  ; who du leader du convoi
+  next-shot-time ; Compteur qui verifie que le drone n'a pas tiré recemment
+  convoi-position; Prochaine position du convoi
+]
+
+to setup-drones
+  if nb-drones > 0 [
+
+    let base-min-pxcor min [pxcor] of (patches with [base? and pzcor = mapAlt and pycor > 0])
+    let base-max-pxcor max [pxcor] of (patches with [base? and pzcor = mapAlt and pycor > 0])
+    let base-min-pycor min [pycor] of (patches with [base? and pzcor = mapAlt])
+    let base-max-pycor max [pycor] of (patches with [base? and pzcor = mapAlt])
+
+    create-drones nb-drones
+    let identifiant 0
+    let first-drone 0
+    let previous-who 0
+    set drone-speed 0.1 * simu-speed
+
+    ask drones
+    [
+      ;Init apparence
+      set shape "airplane"
+      set color cyan
+
+      ; Init des structures BDI
+      set incoming-queue [] ; Do not change
+      
+      ;Init variables drones
+      set fuel max-fuel
+      set ammo max-ammo
+      set going-base? false
+      set roll 0
+      set pitch 0
+      set heading 0
+      set leader? false
+      set drone-next patch 0 0 0
+      set drone-path []
+      set observations []
+      set mission ""
+      set move-mode ""
+      set leader-convoi -1
+      set convoi-position patch 6 12 solalt ; On initialise la position a la fin de la piste de départ des voitures
+
+      set id-drone identifiant
+      if identifiant = 0 [ set first-drone who ]
+      set identifiant (identifiant + 1)
+
+      ; Visualisation
+      set label who ; display the drone names
+
+      set previous-who who
+    ]
+
+    ; Initialisation du leader
+    ask drone first-drone [
+      set leader? true
+      set color orange
+      
+      if any? convois with [leader?] [
+        
+        ; On intialise le who du leader convoi
+        set leader-convoi [who] of one-of convois with [leader?]
+        
+        ; On indique aussi au leader du convoi qu'on est le leader des drones
+        ask convoi leader-convoi [ set leader-drone first-drone ]
+      ]
+    ]
+    
+    let nb-protectors round (proportion-protecteurs * nb-drones / 100 )
+    let nb-hunters nb-drones - nb-protectors
+    show (word "Il y a " nb-hunters " chasseurs contre " nb-protectors " protecteurs")
+
+    ; On lie chaque drone avec le leader
+    ask drones with [not leader?] [ create-drone-link-to turtle first-drone ]
+
+    ; On intialise les positions et les missions
+    ask turtle-set sort-on [id-drone] drones [
+      
+      ; On initialise les coordonnées sur la piste de décollage
+      ifelse (id-drone - 1) mod 2 = 0 [ set xcor base-min-pxcor ] [ set xcor base-max-pxcor ] ; a gauche ou a droite selon le nombre (pair ou impair respectivement)
+      set ycor base-max-pycor - (floor (id-drone / 2) / (nb-drones / 2) * (base-max-pycor - base-min-pycor)) ; d'une rangee de plus en plus basse toutes les deux voitures
+      set zcor solAlt
+            
+      if id-drone < nb-hunters [
+        set mission "hunt"
+        set move-mode "join-convoi"
+      ]
+      
+      if id-drone >= nb-hunters [
+        ; Initialisation de la mission
+        set mission "protect"
+        set move-mode "join-convoi"
+        
+        ; On fait un décalage dans les décollages
+        ; On prend ici le critère : convoi a parcouru la longueur de la carte au maximum quand le dernier décolle
+        let gap ( max-pxcor / convoi-speed / nb-drones )
+        set start-tick gap * ( id-drone - nb-hunters )
+      ]
+   ]
+]
+end
+
+
+;Méthode de déplacement principale des drones
+to move-drone
+ ;On écoute nos messages
+ ask drones [
+   message-recu-drone
+ ]
+
+ ;On determine la prochaine position du drone
+ update-drone-destination
+  
+ ;On demande aux drones d'avancer
+ ask drones [
+   ; On demande aux drones de bouger si leur heure de départ est passée
+   if ticks > start-tick [
+     
+     ; Je me tourne vers la prochaine case si elle a été définie
+     if drone-next != patch 0 0 0 [ face drone-next ]
+     
+     ; On avance devant s'il n'y a pas d'obtacle
+     if (not [obstacle?] of patch-ahead 1)[fd drone-speed]
+     
+     ; On décrémente l'essence comme on a avancé  
+     set fuel (fuel - fuel-dec)
+   
+     ; On verifie que l'on n'est pas a court de carburant, sinon on meurt
+     if fuel <= 0 [ die stop]
+
+     ; Le drone fait ses observations/attaques en fonction de ses alentours
+     observe-drone
+   ]
+ ]
+end
+
+
+;Sélection de la prochaine destination
+to update-drone-destination
+ foreach sort-on [who] turtle-set drones
+ [ 
+   ;Gestion du cas d'aterrissage
+   if [patch-here] of ? = landing-patch
+   [
+     ask ? [ set drone-next patch-at -1 0 -1 set drone-path [] ]
+     stop
+   ]
+
+   ;On met a jour le path a-star si on est sur la prochaine case de l'itineraire
+   if not empty? ([drone-path] of ?) and ([patch-here] of ?) =  (first [drone-path] of ?)
+   [
+     ask ? [ set drone-path but-first drone-path ] ;On enleve le premier element de l'itineraire
+   ]
+   
+   ; Traitement du cas ou on est sur la base
+   let is-landing? [landing?] of ([patch-here] of ?)
+   let is-take-off? [take-off?] of ([patch-here] of ?)
+   ifelse is-landing? or is-take-off?
+   [ 
+     ; Si on est sur la piste d'aterissage, on va vers la gauche et on fait le plein
+     ifelse is-take-off?
+     [ ; Piste de decolage, on augmente y de 1
+       ask ? [ set drone-next patch-at 0 1 0] ; On augmente y de 1   
+     ]
+     [
+       if ([patch-here] of ?) = refill-patch
+       [ ; On fait le plein
+         ask ? [ set fuel max-fuel set ammo max-ammo set going-base? false ]
+       ]
+       ask ? [ set drone-next patch-at -1 0 0] ; On reduit x de 1      
+     ]
+     
+     ;Gestion du cas de decolage
+     if [pycor] of ? = 11
+     [
+       ask ? [ set drone-next patch-at 0 1 1 ]
+     ]
+   ]
+   [  ;Nous ne sommes pas a la base : si on a assez essence on suit notre objectif
+     ifelse must-refill-fuel ? or [ammo] of ? <= 0 or [going-base?] of ?
+     [
+       ;Si on n'est pas en train de rentrer a la base, on definit un A* vers la base
+       if not [going-base?] of ?   [
+         let drone-patch [patch-here] of ?
+         let thePath plan-astar drone-patch landing-patch false
+         ask ? [ set drone-path thePath set going-base? true ]          
+        ]
+     ]
+     [ ; On est libre de faire ce qu'on veut selon notre mission
+       if [mission] of ? = "protect" [ protect-convoi ?]
+       
+       if [mission] of ? = "hunt" [ hunt ? ]
+     ]
+     ; On prend comme prochain patch le premier du chemin astar s'il existe
+     ask ? [
+       if not empty? ([drone-path] of ?)
+       [ set drone-next first drone-path ]
+     ]        
+   ]
+ ]
+end
+
+
+; Vérificaton de si on est Ok niveau carburant
+to-report must-refill-fuel [drone-to-check]
+  let must-refill? false
+  let refill-dist 0
+  ask drone-to-check [ set refill-dist distance-nowrap landing-patch ] 
+  
+  ; on ajoute la longueur de la piste
+  set refill-dist (refill-dist + 8)
+  
+  ;On laisse 100% de marge pour le retour au cas ou
+  if ([fuel] of drone-to-check) < (2 * ( refill-dist ) * fuel-dec / drone-speed)
+  [ set must-refill? true ]
+
+  report must-refill?
+end
+
+
+; Cette fonction gère les déplacements des drones qui protège le convoi 
+to protect-convoi [this-drone]
+  
+  ;Cas ou on doit rejoindre le convoi
+  ifelse [move-mode] of this-drone = "join-convoi" [
+
+    ; On recupère la prochaine étape du convoi
+    let destination landing-patch
+    
+    ;Si on y est déjà on rentre à la base. Sinon, on rejoint le convoi
+    if not ([patch-here] of this-drone = [convoi-position] of this-drone) [
+      set destination  [convoi-position] of this-drone
+    ]
+      
+    ; On place le patch a hauteur du drone
+    set destination [patch-at 0 0 ([pzcor] of this-drone - [pzcor] of destination)] of destination
+    
+    ;Si on est déjà arrivé, on fait un cercle autour du convoi pour le protéger
+    ifelse destination != [patch-here] of this-drone [
+
+      ;Si on n'a pas encore décidé du chemin, on utilise A* pour rejoindre le convoi
+      if empty? ([drone-path] of this-drone) [ 
+ 
+        let drone-patch [patch-here] of this-drone
+        let thePath plan-astar drone-patch destination false
+        ask this-drone [ set drone-path thePath ]
+      ]
+    ]
+    [ ; On est déjà arrivé  : on commence un parcours de cercle autour du convoi
+      ask this-drone [
+        ; Le drone tourne de 90 degrés pour commencer son cercle orthogonal au chemin
+        rt 90
+        set drone-next patch 0 0 0
+        set move-mode "rotation-convoi"
+        set rotation-angle 0 ; On initialise à 0 le compteur de rotation totale
+      ]
+      stop
+    ]
+
+  ]
+  [
+    ; On est en mode "rotation-convoi" : on poursuit la rotation jusqu'à ce qu'on rejoigne notre point de départ
+    ask this-drone [
+
+      let angle 1 * simu-speed ; Angle du virage
+      
+      ; On tourne de cet angle et on l'ajoute à notre rotation totale
+      rt angle
+      set rotation-angle rotation-angle + angle
+ 
+      ; On vérifie si on a fini le cercle, on repart vers l'avant du convoi
+      if rotation-angle >= 360 [ set move-mode "join-convoi" ]
+    ]
+ ]
+end
+
+
+; Cette fonction gère les déplacements des drones qui partent en éclaireur chasser les ennemis sur le chemin du convoi
+; Ces drones vont faire des aller-retour entre l'objectif et le convoi
+to hunt [ this-drone ]
+  ifelse [move-mode] of this-drone = "explore" [
+    ;Si le chemin est rempli on avance dessus
+    ;S'il est vide c'est qu'on est arrivé au niveau de l'objectif : on repart vers le convoi
+    if empty? ([drone-path] of this-drone) [ 
+      
+      ; S'il n'y a pas de chemin A* définit pour le convoi, on rentre a la base
+      let destination landing-patch
+      
+      ;Si on y est déjà on rentre à la base. Sinon, on rejoint le convoi
+      if not ([patch-here] of this-drone = [convoi-position] of this-drone) [
+        set destination  [convoi-position] of this-drone
+      ]
+ 
+      let drone-patch [patch-here] of this-drone
+        
+      ; On place le patch a hauteur du drone
+      set destination [patch-at 0 0 ([pzcor] of this-drone - [pzcor] of destination)] of destination
+ 
+      let thePath plan-astar drone-patch destination false
+      ask this-drone [
+        set drone-path thePath
+        set move-mode "join-convoi"
+      ]
+    ]     
+  ]
+  [
+    ;Si le chemin est rempli on avance dessus
+    ;S'il est vide c'est qu'on est arrivé au niveau du convoi : on repart vers l'objectif
+    if empty? ([drone-path] of this-drone) [ 
+ 
+      let drone-patch [patch-here] of this-drone
+    
+      ; On intialise la destination à l'objectif
+      let destination (one-of patches with [objectif?])
+        
+      ; On place le patch a hauteur du drone
+      set destination [patch-at 0 0 ([pzcor] of this-drone - [pzcor] of destination)] of destination
+ 
+      let thePath plan-astar drone-patch destination false
+      ask this-drone[
+        set drone-path thePath
+        set move-mode "explore"
+      ]
+    ]    
+  ] 
+end
+
+
+; Observation par un drone de ses alentours
+to observe-drone ;
+    
+  ; On vérifie la présence d'ennemis
+  let my-enemies enemies in-cone-nowrap vision-drone 180
+  if any? my-enemies [
+    
+    ;Le leader doit etre informé
+    ifelse leader?
+    [ ; Si on est leaer, MAJ de structure de donnee
+      foreach sort-on [who] my-enemies [   
+        set observations lput (word ([pxcor] of ?) " " ([pycor] of ?) " " ticks )  observations ]
+            
+    ]
+    [ ;Si on n'est pas leader : envoi au leader
+      let leader one-of out-drone-link-neighbors
+      foreach sort-on [who] my-enemies
+      [   
+        ;Format du message a envoyer : x y tick
+        communication-DD "obs" leader (word ([pxcor] of ?) " " ([pycor] of ?) " " ticks )  
+      ]
+    ]
+    
+    ;On lance une attaque sur l'adversaire
+    if ammo > 0 and any? enemies in-cone-nowrap portee-drone 180 and next-shot-time < ticks [
+      let target min-one-of enemies [distance-nowrap myself] ; cible la plus proche
+      attack-target target precision-drone portee-drone
+      set ammo ammo - 1
+      set next-shot-time next-shot-time + time-between-shots
+    ]
+  ]
+  
+  ; Si on est leader on regarde si on a recu des observations d'ennemis
+  if leader? [
+    let msg get-message
+    if msg != "" and get-performative msg = "obs" [
+      let string get-content msg
+          
+      ;MAJ structure de donnees
+      ;show (word get-element string 0 " et " get-element string 2 " et " get-element string 3) 
+      set observations lput string  observations
+          
+      ;On envoie les infos aux leader du convoi
+      communication-DC "obs" leader-convoi string
+    ]
+  ]
+end
+
+
+; Communication Drone-Drone
+to communication-DD [perf receiver content] 
+   let mess create-message perf 
+   set mess add-receiver [who] of receiver mess 
+   set mess add-content content mess 
+   send mess 
+end
+
+
+;Communication Drone-Voiture
+to communication-DC [perf receiver content] 
+   let mess create-message perf 
+   set mess add-receiver receiver mess 
+   set mess add-content content mess 
+   send mess 
+end
+
+; reception de messages d'observation des drones
+to message-recu-drone
+  let msg ""
+  set msg get-message
+  if msg = "" [ stop ]
+
+  ; Decodage du message
+  let perf get-performative msg 
+
+  if perf = "new-position-convoi" [
+    let string get-content msg
+    set convoi-position patch (get-element string 1) (get-element string 2) solalt
+   
+    ;Si on est leader, on envoie l'info aux autres
+    if leader? [
+      foreach sort-on [who] drones with [ not leader? ] [
+        communication-DD "new-position-convoi" ? string
+      ]
+    ]
+  ]
+end
+
+;Gestion du cas où on est touchés par une rocket ennemi
+to drone-touched [target]
+  if [leader?] of target [
+    pass-leadership-drone target one-of drones with [not leader? ]
+  ]
+  ask target [ die ]
+end
+
+
+;Cette fonction communique les informations nécessaires à un changement de leader parmi les drones
+to pass-leadership-drone [ from next ]
+  ask next [
+    set color orange
+    set leader? true
+    set leader-convoi  [leader-convoi] of from
+    let my-who who
+    ask convoi leader-convoi [ set leader-drone my-who ]
+    ask drones with [not leader?] [ create-drone-link-to next ]
+  ]
+end
